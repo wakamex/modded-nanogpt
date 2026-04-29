@@ -36,6 +36,7 @@ SPECTRUM_STEPS_ENV = os.environ.get(
     "TRACK3_SPECTRUM_STEPS",
     "1,2,4,8,16,32,64,125,250,500,750,1000,1500,2000,2500,3000,3400",
 )
+SPECTRUM_EVERY = int(os.environ.get("TRACK3_SPECTRUM_EVERY", "0"))
 
 
 def parse_int_set(raw: str) -> set[int]:
@@ -259,7 +260,11 @@ def zeropower_via_coeff_tensor(G: Tensor, coeffs: Tensor) -> Tensor:
 
 
 def maybe_log_spectrum(step: int, name: str, matrix: Tensor):
-    if not SPECTRUM_ENABLED or step not in SPECTRUM_STEPS:
+    if not SPECTRUM_ENABLED:
+        return
+    if SPECTRUM_EVERY <= 0 and step not in SPECTRUM_STEPS:
+        return
+    if SPECTRUM_EVERY > 0 and step % SPECTRUM_EVERY != 0:
         return
     X = matrix.detach()
     if X.size(-2) > X.size(-1):
@@ -386,7 +391,9 @@ print0(f"TRACK3_STOP_AFTER={STOP_AFTER_OVERRIDE or '<train_steps>'}")
 print0(f"TRACK3_DENSE_VAL_START={DENSE_VAL_START}")
 print0(f"TRACK3_SPECTRUM_ENABLED={SPECTRUM_ENABLED}")
 if SPECTRUM_ENABLED:
-    print0(f"TRACK3_SPECTRUM_STEPS={sorted(SPECTRUM_STEPS)}")
+    print0(f"TRACK3_SPECTRUM_EVERY={SPECTRUM_EVERY}")
+    if SPECTRUM_EVERY <= 0:
+        print0(f"TRACK3_SPECTRUM_STEPS={sorted(SPECTRUM_STEPS)}")
     print0(f"TRACK3_SPECTRUM_DIR={SPECTRUM_DIR}")
 print0("="*100)
 
