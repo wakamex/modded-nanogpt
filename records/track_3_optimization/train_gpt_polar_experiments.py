@@ -239,6 +239,25 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         X = X.mT
     return X
 
+
+def zeropower_via_coeff_tensor(G: Tensor, coeffs: Tensor) -> Tensor:
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for i in range(coeffs.size(0)):
+        a, b, c = coeffs[i]
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
 def maybe_log_spectrum(step: int, name: str, matrix: Tensor):
     if not SPECTRUM_ENABLED or step not in SPECTRUM_STEPS:
         return
@@ -280,7 +299,15 @@ def muon_update(update):
     return update
 
 
-if POLAR_MODE != "adaptive":
+def muon_update_adaptive(update, coeffs: Tensor):
+    update = zeropower_via_coeff_tensor(update, coeffs)
+    update *= max(1, update.size(-2) / update.size(-1))**0.5
+    return update
+
+
+if POLAR_MODE == "adaptive":
+    muon_update_adaptive = torch.compile(muon_update_adaptive)
+else:
     muon_update = torch.compile(muon_update)
 
 class Muon(torch.optim.Optimizer):
@@ -296,6 +323,9 @@ class Muon(torch.optim.Optimizer):
         global CURRENT_MUON_STEP
         self.step_count += 1
         CURRENT_MUON_STEP = self.step_count
+        adaptive_coeffs = None
+        if POLAR_MODE == "adaptive":
+            adaptive_coeffs = torch.tensor(get_polar_coeffs(self.step_count), device=device, dtype=torch.float32)
         world_size = dist.get_world_size()
         rank = dist.get_rank()
         for group in self.param_groups:
@@ -310,7 +340,10 @@ class Muon(torch.optim.Optimizer):
                     state["momentum"].lerp_(p.grad, 1 - group["mu"])
                     update_input = p.grad.lerp(state["momentum"], group["mu"])
                     maybe_log_spectrum(self.step_count, MUON_PARAM_NAMES.get(id(p), ""), update_input)
-                    update = muon_update(update_input)
+                    if adaptive_coeffs is None:
+                        update = muon_update(update_input)
+                    else:
+                        update = muon_update_adaptive(update_input, adaptive_coeffs)
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
