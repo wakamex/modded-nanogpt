@@ -160,6 +160,7 @@ def step_bounds(
     lower_aggregate_quantile: float,
     upper_field: str,
     upper_aggregate_quantile: float,
+    upper_override: float | None,
     floor: float,
     ceil: float,
     train_steps: int,
@@ -169,10 +170,13 @@ def step_bounds(
         by_step.setdefault(int(row["step"]), []).append(row)
     observed = []
     for step, step_rows in by_step.items():
-        if not has_positive_finite(step_rows, upper_field):
+        if upper_override is None and not has_positive_finite(step_rows, upper_field):
             continue
         lower = bound_from_rows(step_rows, lower_field, lower_aggregate_quantile, floor, ceil)
-        upper = bound_from_rows(step_rows, upper_field, upper_aggregate_quantile, floor, ceil)
+        if upper_override is None:
+            upper = bound_from_rows(step_rows, upper_field, upper_aggregate_quantile, floor, ceil)
+        else:
+            upper = upper_override
         observed.append((step, *valid_bounds(lower, upper, floor)))
     observed.sort()
     if not observed:
@@ -268,6 +272,7 @@ def main() -> None:
             lower_aggregate_quantile=args.aggregate_quantile,
             upper_field=args.upper_field,
             upper_aggregate_quantile=args.upper_aggregate_quantile,
+            upper_override=args.upper,
             floor=args.floor,
             ceil=args.ceil,
             train_steps=args.train_steps,
