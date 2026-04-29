@@ -75,8 +75,13 @@ def optimal_quintic(lower: float, upper: float) -> tuple[float, float, float]:
             dtype=np.float64,
         )
         a, b, c, error = np.linalg.solve(lhs, np.ones(4, dtype=np.float64))
-        roots = (-3 * b + np.array([-1, 1]) * math.sqrt(9 * b**2 - 20 * a * c)) / (10 * c)
-        q, r = np.sqrt(roots)
+        discriminant = 9 * b**2 - 20 * a * c
+        if discriminant < 0:
+            if discriminant < -1e-8:
+                raise ValueError(f"negative quintic discriminant {discriminant}")
+            discriminant = 0.0
+        roots = (-3 * b + np.array([-1, 1]) * math.sqrt(discriminant)) / (10 * c)
+        q, r = np.sqrt(np.maximum(roots, 0))
     return float(a), float(b), float(c)
 
 
@@ -130,8 +135,12 @@ def read_spectrum_rows(path: Path) -> list[dict]:
 def quantile(values: list[float], q: float) -> float:
     arr = np.array([x for x in values if x > 0 and math.isfinite(x)], dtype=np.float64)
     if arr.size == 0:
-        raise ValueError("no positive finite values available")
+        return 0.0
     return float(np.quantile(arr, q))
+
+
+def has_positive_finite(rows: list[dict], field: str) -> bool:
+    return any(float(row[field]) > 0 and math.isfinite(float(row[field])) for row in rows)
 
 
 def bound_from_rows(rows: list[dict], field: str, aggregate_quantile: float, floor: float, ceil: float) -> float:
@@ -160,6 +169,8 @@ def step_bounds(
         by_step.setdefault(int(row["step"]), []).append(row)
     observed = []
     for step, step_rows in by_step.items():
+        if not has_positive_finite(step_rows, upper_field):
+            continue
         lower = bound_from_rows(step_rows, lower_field, lower_aggregate_quantile, floor, ceil)
         upper = bound_from_rows(step_rows, upper_field, upper_aggregate_quantile, floor, ceil)
         observed.append((step, *valid_bounds(lower, upper, floor)))
