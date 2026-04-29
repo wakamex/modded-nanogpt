@@ -82,14 +82,21 @@ def optimal_quintic(lower: float, upper: float) -> tuple[float, float, float]:
 
 def optimal_composition(
     lower: float,
+    initial_upper: float,
     steps: int,
     *,
     cushion: float,
     safety: float,
 ) -> list[list[float]]:
-    upper = 1.0
+    if not 0 <= lower <= initial_upper <= 1.0:
+        raise ValueError(f"expected 0 <= lower <= upper <= 1, got lower={lower} upper={initial_upper}")
+    upper = initial_upper
     coeffs: list[tuple[float, float, float]] = []
     for _ in range(steps):
+        if lower > upper:
+            if lower - upper > 1e-8:
+                raise ValueError(f"composition bounds inverted: lower={lower} upper={upper}")
+            lower = upper = (lower + upper) / 2
         a, b, c = optimal_quintic(max(lower, cushion * upper), upper)
         p_lower = a * lower + b * lower**3 + c * lower**5
         p_upper = a * upper + b * upper**3 + c * upper**5
@@ -127,40 +134,59 @@ def quantile(values: list[float], q: float) -> float:
     return float(np.quantile(arr, q))
 
 
-def lower_from_rows(rows: list[dict], field: str, aggregate_quantile: float, floor: float) -> float:
-    return max(floor, min(1.0, quantile([float(row[field]) for row in rows], aggregate_quantile)))
+def bound_from_rows(rows: list[dict], field: str, aggregate_quantile: float, floor: float, ceil: float) -> float:
+    return max(floor, min(ceil, quantile([float(row[field]) for row in rows], aggregate_quantile)))
 
 
-def step_lowers(
+def valid_bounds(lower: float, upper: float, floor: float) -> tuple[float, float]:
+    lower = max(floor, min(1.0, lower))
+    upper = max(lower * (1 + 1e-6), min(1.0, upper))
+    return lower, upper
+
+
+def step_bounds(
     rows: list[dict],
     *,
-    field: str,
-    aggregate_quantile: float,
+    lower_field: str,
+    lower_aggregate_quantile: float,
+    upper_field: str,
+    upper_aggregate_quantile: float,
     floor: float,
+    ceil: float,
     train_steps: int,
-) -> dict[int, float]:
+) -> dict[int, tuple[float, float]]:
     by_step: dict[int, list[dict]] = {}
     for row in rows:
         by_step.setdefault(int(row["step"]), []).append(row)
-    observed = sorted((step, lower_from_rows(step_rows, field, aggregate_quantile, floor)) for step, step_rows in by_step.items())
+    observed = []
+    for step, step_rows in by_step.items():
+        lower = bound_from_rows(step_rows, lower_field, lower_aggregate_quantile, floor, ceil)
+        upper = bound_from_rows(step_rows, upper_field, upper_aggregate_quantile, floor, ceil)
+        observed.append((step, *valid_bounds(lower, upper, floor)))
+    observed.sort()
     if not observed:
         raise ValueError("no observed steps")
 
-    result: dict[int, float] = {}
+    result: dict[int, tuple[float, float]] = {}
     obs_steps = [x[0] for x in observed]
-    obs_logs = [math.log(x[1]) for x in observed]
+    lower_logs = [math.log(x[1]) for x in observed]
+    upper_logs = [math.log(x[2]) for x in observed]
     for step in range(1, train_steps + 1):
         right = np.searchsorted(obs_steps, step, side="right")
         if right == 0:
-            lower_log = obs_logs[0]
+            lower_log = lower_logs[0]
+            upper_log = upper_logs[0]
         elif right >= len(obs_steps):
-            lower_log = obs_logs[-1]
+            lower_log = lower_logs[-1]
+            upper_log = upper_logs[-1]
         else:
             s0, s1 = obs_steps[right - 1], obs_steps[right]
-            y0, y1 = obs_logs[right - 1], obs_logs[right]
+            lower_y0, lower_y1 = lower_logs[right - 1], lower_logs[right]
+            upper_y0, upper_y1 = upper_logs[right - 1], upper_logs[right]
             t = (step - s0) / (s1 - s0)
-            lower_log = y0 + t * (y1 - y0)
-        result[step] = math.exp(lower_log)
+            lower_log = lower_y0 + t * (lower_y1 - lower_y0)
+            upper_log = upper_y0 + t * (upper_y1 - upper_y0)
+        result[step] = valid_bounds(math.exp(lower_log), math.exp(upper_log), floor)
     return result
 
 
@@ -171,9 +197,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--lower", type=float)
-    parser.add_argument("--field", default="q010")
-    parser.add_argument("--aggregate-quantile", type=float, default=0.1)
+    parser.add_argument("--upper", type=float)
+    parser.add_argument("--field", "--lower-field", dest="field", default="q010")
+    parser.add_argument("--aggregate-quantile", "--lower-aggregate-quantile", dest="aggregate_quantile", type=float, default=0.1)
+    parser.add_argument("--upper-field", default="q1000")
+    parser.add_argument("--upper-aggregate-quantile", type=float, default=1.0)
     parser.add_argument("--floor", type=float, default=1e-5)
+    parser.add_argument("--ceil", type=float, default=1.0)
     parser.add_argument("--cushion", type=float, default=0.02407327424182761)
     parser.add_argument("--safety", type=float, default=1.01)
     parser.add_argument("--train-steps", type=int, default=3500)
@@ -194,46 +224,66 @@ def main() -> None:
         if lower is None:
             if rows is None:
                 raise ValueError("--lower or --spectrum is required for fixed mode")
-            lower = lower_from_rows(rows, args.field, args.aggregate_quantile, args.floor)
+            lower = bound_from_rows(rows, args.field, args.aggregate_quantile, args.floor, args.ceil)
+        upper = args.upper
+        if upper is None:
+            if rows is None:
+                upper = 1.0
+            else:
+                upper = bound_from_rows(rows, args.upper_field, args.upper_aggregate_quantile, args.floor, args.ceil)
+        lower, upper = valid_bounds(lower, upper, args.floor)
         payload = {
-            "name": f"fixed_lower{lower:.6g}_steps{args.steps}",
+            "name": f"fixed_lower{lower:.6g}_upper{upper:.6g}_steps{args.steps}",
             "mode": args.mode,
             "steps": args.steps,
             "lower": lower,
+            "upper": upper,
             "field": args.field,
             "aggregate_quantile": args.aggregate_quantile,
+            "upper_field": args.upper_field,
+            "upper_aggregate_quantile": args.upper_aggregate_quantile,
             "floor": args.floor,
+            "ceil": args.ceil,
             "cushion": args.cushion,
             "safety": args.safety,
-            "coeffs": optimal_composition(lower, args.steps, cushion=args.cushion, safety=args.safety),
+            "coeffs": optimal_composition(lower, upper, args.steps, cushion=args.cushion, safety=args.safety),
         }
     else:
         if rows is None:
             raise ValueError("--spectrum is required for adaptive mode")
-        lowers = step_lowers(
+        bounds = step_bounds(
             rows,
-            field=args.field,
-            aggregate_quantile=args.aggregate_quantile,
+            lower_field=args.field,
+            lower_aggregate_quantile=args.aggregate_quantile,
+            upper_field=args.upper_field,
+            upper_aggregate_quantile=args.upper_aggregate_quantile,
             floor=args.floor,
+            ceil=args.ceil,
             train_steps=args.train_steps,
         )
-        cache: dict[float, list[list[float]]] = {}
+        cache: dict[tuple[float, float], list[list[float]]] = {}
         step_coeffs = {}
-        for step, lower in lowers.items():
-            key = round(lower, 10)
+        step_bounds_payload = {}
+        for step, (lower, upper) in bounds.items():
+            key = (round(lower, 10), round(upper, 10))
             if key not in cache:
-                cache[key] = optimal_composition(lower, args.steps, cushion=args.cushion, safety=args.safety)
+                cache[key] = optimal_composition(lower, upper, args.steps, cushion=args.cushion, safety=args.safety)
             step_coeffs[str(step)] = cache[key]
+            step_bounds_payload[str(step)] = [lower, upper]
         payload = {
             "name": f"adaptive_{args.field}_q{args.aggregate_quantile}_steps{args.steps}",
             "mode": args.mode,
             "steps": args.steps,
             "field": args.field,
             "aggregate_quantile": args.aggregate_quantile,
+            "upper_field": args.upper_field,
+            "upper_aggregate_quantile": args.upper_aggregate_quantile,
             "floor": args.floor,
+            "ceil": args.ceil,
             "cushion": args.cushion,
             "safety": args.safety,
             "train_steps": args.train_steps,
+            "step_bounds": step_bounds_payload,
             "step_coeffs": step_coeffs,
         }
 
@@ -241,7 +291,8 @@ def main() -> None:
     with args.output.open("w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
-    print(json.dumps({k: payload[k] for k in payload if k != "coeffs" and k != "step_coeffs"}, indent=2, sort_keys=True))
+    hidden_fields = {"coeffs", "step_coeffs", "step_bounds"}
+    print(json.dumps({k: payload[k] for k in payload if k not in hidden_fields}, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
