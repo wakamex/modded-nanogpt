@@ -601,7 +601,6 @@ for step in range(args.train_steps + 1):
             + f"step_avg:{1000 * approx_training_time / (step + 1):.2f}ms"
             + gate_text,
             console=True,
-            log=False,
         )
 
 if dist_ready():
