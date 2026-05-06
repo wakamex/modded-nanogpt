@@ -278,6 +278,22 @@ CANDIDATES = {
 }
 
 CAMPAIGNS = {
+    "ordinal-calibration-poprisk-6h": [
+        ("muon-025-0125", 3),
+        ("muon-035-025", 3),
+        ("adamh", 3),
+        ("poprisk-adamh-003-w50", 3),
+        ("poprisk-adamh-003-w0", 3),
+        ("poprisk-adamh-snr-wiener", 3),
+        ("poprisk-adamh-snr-var", 3),
+        ("muon-025-0125", 4),
+        ("muon-035-025", 4),
+        ("adamh", 4),
+        ("poprisk-adamh-003-w50", 4),
+        ("poprisk-adamh-003-w0", 4),
+        ("poprisk-adamh-snr-wiener", 4),
+        ("poprisk-adamh-snr-var", 4),
+    ],
     "adamh-poprisk-principled-4h": [
         ("adamh", 3),
         ("poprisk-adamh-003-w50", 3),
