@@ -2,8 +2,10 @@
 Local Track 3 proxy runner.
 
 This keeps the Track 3 model family, FineWeb tokenization, Muon matrix
-optimizer, and Adam-style non-matrix optimizer split, but scales the model and
-batch down so a single 24GB GPU can run short optimizer ablations.
+optimizer, and Adam-style non-matrix optimizer split. By default it scales the
+model and batch down so a single 24GB GPU can run short optimizer ablations;
+the ordinal preset keeps the benchmark architecture shape and rescales reduced
+local batches to the benchmark gradient magnitude.
 """
 
 import argparse
@@ -618,8 +620,35 @@ def default_data_dir():
     nvme = Path("/nvme2/modded-nanogpt-data/fineweb10B")
     return nvme if nvme.exists() else Path("data/fineweb10B")
 
+PROXY_PRESETS = {
+    "small": {},
+    "ordinal-3090": {
+        "num_layers": 12,
+        "model_dim": 768,
+        "head_dim": 128,
+        "batch_tokens": 32768,
+        "microbatch_seqs": 1,
+        "val_tokens": 262144,
+        "val_interval": 50,
+        "log_interval": 10,
+        "reference_batch_tokens": 8 * 64 * 1024,
+    },
+}
+
+def _arg_was_provided(argv, dest: str) -> bool:
+    flag = "--" + dest.replace("_", "-")
+    return any(arg == flag or arg.startswith(flag + "=") for arg in argv)
+
+def apply_proxy_preset(args, argv):
+    for dest, value in PROXY_PRESETS[args.proxy_preset].items():
+        if not _arg_was_provided(argv, dest):
+            setattr(args, dest, value)
+    return args
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Single-GPU/local proxy for Track 3 optimizer tests")
+    parser.add_argument("--proxy-preset", choices=sorted(PROXY_PRESETS), default="small",
+                        help="Apply a reusable local proxy shape before explicit CLI overrides")
     parser.add_argument("--optimizer", choices=["adamw", "poprisk-adamw"], default="adamw")
     parser.add_argument("--matrix-optimizer", choices=["muon", "adamh", "poprisk-adamh"], default="muon")
     parser.add_argument("--train-steps", type=int, default=1000)
@@ -628,6 +657,8 @@ def parse_args():
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--batch-tokens", type=int, default=32768)
+    parser.add_argument("--reference-batch-tokens", type=int, default=0,
+                        help="If positive, multiply gradients by reference_batch_tokens / batch_tokens")
     parser.add_argument("--microbatch-seqs", type=int, default=4)
     parser.add_argument("--val-tokens", type=int, default=262144)
     parser.add_argument("--num-layers", type=int, default=6)
@@ -658,7 +689,7 @@ def parse_args():
     parser.add_argument("--pop-rho", type=float, default=0.95)
     parser.add_argument("--pop-warmup-steps", type=int, default=20)
     parser.add_argument("--pop-gate", choices=["soft", "hard", "snr"], default="soft")
-    return parser.parse_args()
+    return apply_proxy_preset(parser.parse_args(), sys.argv[1:])
 
 args = parse_args()
 if not 0 <= args.pop_lambda_decay_start_frac <= 1:
@@ -679,6 +710,10 @@ else:
 assert device.type == "cuda", "This proxy is intended for CUDA GPUs"
 assert args.batch_tokens % args.seq_len == 0
 assert args.val_tokens % args.seq_len == 0
+if args.reference_batch_tokens < 0:
+    raise ValueError("--reference-batch-tokens must be non-negative")
+reference_batch_tokens = args.reference_batch_tokens or args.batch_tokens
+grad_scale = reference_batch_tokens / args.batch_tokens
 
 torch.manual_seed(args.seed + get_rank())
 torch.cuda.manual_seed(args.seed + get_rank())
@@ -702,6 +737,8 @@ config["world_size"] = get_world_size()
 config["device_name"] = torch.cuda.get_device_name(device)
 config["pop_lambda_decay_start_step"] = pop_lambda_decay_start_step
 config["adamh_warmup_steps_resolved"] = adamh_warmup_steps
+config["reference_batch_tokens_resolved"] = reference_batch_tokens
+config["grad_scale"] = grad_scale
 
 print0(code)
 print0("=" * 100)
@@ -898,6 +935,8 @@ for step in range(args.train_steps + 1):
     for name, p in model.named_parameters():
         assert p.grad is not None, name
         maybe_all_reduce(p.grad)
+        if grad_scale != 1:
+            p.grad.mul_(grad_scale)
     set_hparams(step)
     for opt in optimizers:
         opt.step()
