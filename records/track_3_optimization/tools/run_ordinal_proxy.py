@@ -163,6 +163,19 @@ CANDIDATES = {
         "--pop-lambda", "0.03",
         "--pop-warmup-steps", "100",
     ],
+    "poprisk-adamh-hard": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "poprisk-adamh",
+        "--pop-gate", "hard",
+        "--pop-warmup-steps", "0",
+    ],
+    "poprisk-adamh-soft-003": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "poprisk-adamh",
+        "--pop-gate", "soft",
+        "--pop-lambda", "0.03",
+        "--pop-warmup-steps", "0",
+    ],
     "poprisk-adamh-01": [
         "--optimizer", "adamw",
         "--matrix-optimizer", "poprisk-adamh",
@@ -278,6 +291,16 @@ CANDIDATES = {
 }
 
 CAMPAIGNS = {
+    "adamh-poprisk-review-8": [
+        ("adamh", 5),
+        ("poprisk-adamh-003", 5),
+        ("poprisk-adamh-hard", 5),
+        ("poprisk-adamh-soft-003", 5),
+        ("poprisk-adamh-adaptive-q050", 5),
+        ("poprisk-adamh-adaptive-q067", 5),
+        ("poprisk-adamh-cosine-003-zero", 5),
+        ("poprisk-adamh-snr-wiener", 5),
+    ],
     "ordinal-calibration-poprisk-6h": [
         ("muon-025-0125", 3),
         ("muon-035-025", 3),

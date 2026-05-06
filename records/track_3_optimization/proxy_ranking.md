@@ -70,3 +70,26 @@ New one-seed results from seed `1340`:
 5. Probably drop for now: `poprisk-adamh-01`, adaptive median-q variants, cosine decay
 
 Practical read: previous proxy runs say `.003-w50` is real. The latest calibration seed says `snr-wiener` may be much better, but it only has one completed seed so far. Treat `snr-wiener` as the next thing to replicate, not yet as the champion.
+
+## Reviewer-Priority Campaign
+
+The main missing comparison is against the exact PopRisk threshold. Most variants above use continuous SNR shrinkage, not the hard or thresholded-soft PopRisk gate. The review campaign added for this gap is:
+
+```bash
+uv run python records/track_3_optimization/tools/run_ordinal_proxy.py \
+  --campaign adamh-poprisk-review-8 \
+  --estimated-minutes-per-run 24.5
+```
+
+It runs a self-contained fresh-seed block:
+
+| Order | Candidate | Purpose |
+|---:|---|---|
+| 1 | `adamh` | same-seed baseline |
+| 2 | `poprisk-adamh-003` | fixed-lambda SNR sanity check |
+| 3 | `poprisk-adamh-hard` | exact binary PopRisk threshold |
+| 4 | `poprisk-adamh-soft-003` | thresholded soft PopRisk gate, `lambda=.03` |
+| 5 | `poprisk-adamh-adaptive-q050` | self-calibrating SNR gate, median `q=.50` |
+| 6 | `poprisk-adamh-adaptive-q067` | self-calibrating SNR gate, median `q=.67` |
+| 7 | `poprisk-adamh-cosine-003-zero` | time-varying SNR gate, `.03 -> 0` |
+| 8 | `poprisk-adamh-snr-wiener` | parameter-free SNR shrinker |
