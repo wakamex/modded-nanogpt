@@ -19,11 +19,29 @@ REPO_ROOT = TRACK_DIR.parents[1]
 TRAIN_SCRIPT = TRACK_DIR / "train_gpt_local_proxy.py"
 
 CANDIDATES = {
+    "muon-020-010": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.020",
+        "--muon-wd", "0.010",
+    ],
     "muon-025-0125": [
         "--optimizer", "adamw",
         "--matrix-optimizer", "muon",
         "--muon-lr", "0.025",
         "--muon-wd", "0.0125",
+    ],
+    "muon-030-0125": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.030",
+        "--muon-wd", "0.0125",
+    ],
+    "muon-030-025": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.030",
+        "--muon-wd", "0.025",
     ],
     "muon-035-025": [
         "--optimizer", "adamw",
@@ -31,9 +49,33 @@ CANDIDATES = {
         "--muon-lr", "0.035",
         "--muon-wd", "0.025",
     ],
+    "muon-0375-025": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.0375",
+        "--muon-wd", "0.025",
+    ],
     "adamh": [
         "--optimizer", "adamw",
         "--matrix-optimizer", "adamh",
+    ],
+    "poprisk-aux-0001": [
+        "--optimizer", "poprisk-adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.035",
+        "--muon-wd", "0.025",
+        "--pop-gate", "snr",
+        "--pop-lambda", "0.001",
+        "--pop-warmup-steps", "100",
+    ],
+    "poprisk-aux-0003": [
+        "--optimizer", "poprisk-adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.035",
+        "--muon-wd", "0.025",
+        "--pop-gate", "snr",
+        "--pop-lambda", "0.003",
+        "--pop-warmup-steps", "100",
     ],
     "poprisk-aux-001": [
         "--optimizer", "poprisk-adamw",
@@ -42,6 +84,55 @@ CANDIDATES = {
         "--muon-wd", "0.025",
         "--pop-gate", "snr",
         "--pop-lambda", "0.01",
+        "--pop-warmup-steps", "100",
+    ],
+    "poprisk-aux-003": [
+        "--optimizer", "poprisk-adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.035",
+        "--muon-wd", "0.025",
+        "--pop-gate", "snr",
+        "--pop-lambda", "0.03",
+        "--pop-warmup-steps", "100",
+    ],
+    "poprisk-aux-001-w50": [
+        "--optimizer", "poprisk-adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.035",
+        "--muon-wd", "0.025",
+        "--pop-gate", "snr",
+        "--pop-lambda", "0.01",
+        "--pop-warmup-steps", "50",
+    ],
+    "poprisk-aux-001-w200": [
+        "--optimizer", "poprisk-adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.035",
+        "--muon-wd", "0.025",
+        "--pop-gate", "snr",
+        "--pop-lambda", "0.01",
+        "--pop-warmup-steps", "200",
+    ],
+    "poprisk-aux-adaptive-q067": [
+        "--optimizer", "poprisk-adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.035",
+        "--muon-wd", "0.025",
+        "--pop-gate", "snr",
+        "--pop-lambda-mode", "target-median-q",
+        "--pop-target-q", "0.67",
+        "--pop-warmup-steps", "100",
+    ],
+    "poprisk-aux-cosine-003-zero": [
+        "--optimizer", "poprisk-adamw",
+        "--matrix-optimizer", "muon",
+        "--muon-lr", "0.035",
+        "--muon-wd", "0.025",
+        "--pop-gate", "snr",
+        "--pop-lambda", "0.03",
+        "--pop-lambda-final", "0.0",
+        "--pop-lambda-mode", "cosine-decay",
+        "--pop-lambda-decay-start-frac", "0.0",
         "--pop-warmup-steps", "100",
     ],
     "poprisk-adamh-001": [
@@ -53,6 +144,27 @@ CANDIDATES = {
     ],
 }
 
+CAMPAIGNS = {
+    "ordinal-8h": [
+        ("muon-020-010", 0),
+        ("muon-025-0125", 0),
+        ("muon-030-0125", 0),
+        ("muon-030-025", 0),
+        ("muon-035-025", 0),
+        ("muon-0375-025", 0),
+        ("adamh", 0),
+        ("poprisk-aux-0001", 0),
+        ("poprisk-aux-0003", 0),
+        ("poprisk-aux-001", 0),
+        ("poprisk-aux-003", 0),
+        ("poprisk-aux-001-w50", 0),
+        ("poprisk-aux-001-w200", 0),
+        ("poprisk-aux-adaptive-q067", 0),
+        ("poprisk-aux-cosine-003-zero", 0),
+        ("poprisk-adamh-001", 0),
+    ],
+}
+
 VAL_RE = re.compile(r"step:(?P<step>\d+)/(?P<total>\d+) val_loss:(?P<loss>[0-9.]+)")
 LOG_RE = re.compile(r"(?:^| )logfile: (?P<path>\S+)")
 
@@ -60,6 +172,8 @@ LOG_RE = re.compile(r"(?:^| )logfile: (?P<path>\S+)")
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("candidates", nargs="*", help="Candidate names to run, or 'list'")
+    parser.add_argument("--campaign", choices=sorted(CAMPAIGNS), default=None,
+                        help="Named run list; cannot be combined with positional candidates")
     parser.add_argument("--preset", default="ordinal-3090",
                         help="train_gpt_local_proxy.py proxy preset")
     parser.add_argument("--steps", type=int, default=1000)
@@ -67,6 +181,8 @@ def parse_args():
     parser.add_argument("--dense-val-start", type=int, default=-1)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--estimated-minutes-per-run", type=float, default=30.0,
+                        help="Only used to print campaign dry-run/runtime estimates")
     parser.add_argument("--batch-tokens", type=int, default=None)
     parser.add_argument("--reference-batch-tokens", type=int, default=None)
     parser.add_argument("--val-tokens", type=int, default=None)
@@ -77,20 +193,39 @@ def parse_args():
     return parser.parse_args()
 
 
-def candidate_names(requested: list[str]) -> list[str]:
+def candidate_names(requested: list[str]) -> list[tuple[str, int]]:
     if not requested:
-        return ["muon-035-025", "adamh"]
+        requested = ["muon-035-025", "adamh"]
     if requested == ["list"]:
+        print("Candidates:")
         for name in sorted(CANDIDATES):
-            print(name)
+            print(f"  {name}")
+        print("\nCampaigns:")
+        for name, entries in sorted(CAMPAIGNS.items()):
+            print(f"  {name}: {len(entries)} runs")
         raise SystemExit(0)
     unknown = sorted(set(requested) - set(CANDIDATES))
     if unknown:
         raise SystemExit(f"unknown candidate(s): {', '.join(unknown)}")
-    return requested
+    return [(name, 0) for name in requested]
 
 
-def build_command(args, name: str) -> list[str]:
+def run_plan(args) -> list[dict]:
+    if args.campaign and args.candidates:
+        raise SystemExit("--campaign cannot be combined with positional candidates")
+    entries = CAMPAIGNS[args.campaign] if args.campaign else candidate_names(args.candidates)
+    return [
+        {
+            "candidate": name,
+            "seed": args.seed + seed_offset,
+            "seed_offset": seed_offset,
+            "run_index": i,
+        }
+        for i, (name, seed_offset) in enumerate(entries, 1)
+    ]
+
+
+def build_command(args, run: dict) -> list[str]:
     cmd = [
         sys.executable,
         str(TRAIN_SCRIPT),
@@ -99,7 +234,7 @@ def build_command(args, name: str) -> list[str]:
         "--val-interval", str(args.val_interval),
         "--dense-val-start", str(args.dense_val_start),
         "--log-interval", str(args.log_interval),
-        "--seed", str(args.seed),
+        "--seed", str(run["seed"]),
     ]
     for flag, value in [
         ("--batch-tokens", args.batch_tokens),
@@ -109,16 +244,21 @@ def build_command(args, name: str) -> list[str]:
     ]:
         if value is not None:
             cmd.extend([flag, str(value)])
-    cmd.extend(CANDIDATES[name])
+    cmd.extend(CANDIDATES[run["candidate"]])
     if args.extra:
         cmd.extend(args.extra)
     return cmd
 
 
-def run_candidate(args, name: str) -> dict:
-    cmd = build_command(args, name)
+def run_candidate(args, run: dict, total_runs: int) -> dict:
+    name = run["candidate"]
+    cmd = build_command(args, run)
     result = {
         "candidate": name,
+        "run_index": run["run_index"],
+        "total_runs": total_runs,
+        "seed": run["seed"],
+        "seed_offset": run["seed_offset"],
         "command": cmd,
         "returncode": None,
         "logfile": None,
@@ -126,7 +266,7 @@ def run_candidate(args, name: str) -> dict:
         "final_val_loss": None,
         "wall_time_sec": None,
     }
-    print(f"\n=== {name} ===")
+    print(f"\n=== {run['run_index']}/{total_runs} {name} seed={run['seed']} ===")
     print("+ " + shlex.join(cmd))
     if args.dry_run:
         return result
@@ -166,8 +306,12 @@ def write_summary(results: list[dict]) -> Path:
 
 def main():
     args = parse_args()
-    names = candidate_names(args.candidates)
-    results = [run_candidate(args, name) for name in names]
+    plan = run_plan(args)
+    estimated_hours = len(plan) * args.estimated_minutes_per_run / 60
+    if args.campaign or args.dry_run:
+        label = args.campaign or "custom"
+        print(f"Run plan: {label}, {len(plan)} runs, estimated {estimated_hours:.1f} hours")
+    results = [run_candidate(args, run, len(plan)) for run in plan]
     if args.dry_run:
         return
 
