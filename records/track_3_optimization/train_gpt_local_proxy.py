@@ -645,5 +645,7 @@ for step in range(args.train_steps + 1):
             console=True,
         )
 
+print0(f"logfile: {logfile}", console=True, log=False)
+
 if dist_ready():
     dist.destroy_process_group()
