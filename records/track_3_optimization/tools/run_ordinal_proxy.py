@@ -259,6 +259,18 @@ CANDIDATES = {
 }
 
 CAMPAIGNS = {
+    "adamh-poprisk-confirm-4h": [
+        ("adamh", 1),
+        ("poprisk-adamh-003-w50", 1),
+        ("poprisk-adamh-01", 1),
+        ("poprisk-adamh-001-w50", 1),
+        ("poprisk-adamh-adaptive-q050", 1),
+        ("adamh", 2),
+        ("poprisk-adamh-003-w50", 2),
+        ("poprisk-adamh-01", 2),
+        ("poprisk-adamh-001-w50", 2),
+        ("poprisk-adamh-adaptive-q050", 2),
+    ],
     "adamh-poprisk-8h": [
         ("adamh", 0),
         ("poprisk-adamh-0001", 0),
