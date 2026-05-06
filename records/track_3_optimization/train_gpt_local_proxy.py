@@ -8,6 +8,7 @@ batch down so a single 24GB GPU can run short optimizer ablations.
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -278,6 +279,9 @@ class PopRiskAdamW(torch.optim.Optimizer):
         alpha=1.0,
         lambda_pop=1.0,
         lambda_mode="fixed",
+        lambda_final=0.0,
+        lambda_decay_start=0,
+        lambda_decay_end=1,
         target_q=0.5,
         warmup_steps=20,
         gate="soft",
@@ -294,12 +298,29 @@ class PopRiskAdamW(torch.optim.Optimizer):
             alpha=alpha,
             lambda_pop=lambda_pop,
             lambda_mode=lambda_mode,
+            lambda_final=lambda_final,
+            lambda_decay_start=lambda_decay_start,
+            lambda_decay_end=lambda_decay_end,
             target_q=target_q,
             warmup_steps=warmup_steps,
             gate=gate,
         )
         super().__init__(params, defaults)
         self.last_gate_stats = {}
+
+    @staticmethod
+    def _scheduled_lambda(group, step):
+        if group["lambda_mode"] != "cosine-decay":
+            return group["lambda_pop"]
+        start = group["lambda_decay_start"]
+        end = group["lambda_decay_end"]
+        if step <= start:
+            return group["lambda_pop"]
+        if step >= end:
+            return group["lambda_final"]
+        progress = (step - start) / max(end - start, 1)
+        weight = 0.5 * (1 + math.cos(math.pi * progress))
+        return group["lambda_final"] + weight * (group["lambda_pop"] - group["lambda_final"])
 
     @torch.no_grad()
     def step(self):
@@ -340,19 +361,19 @@ class PopRiskAdamW(torch.optim.Optimizer):
         if lambda_mode == "target-median-q" and snr_chunks:
             r_median = torch.median(torch.cat(snr_chunks))
             adaptive_lambda = r_median * (1 - target_q) / target_q
-        lambda_for_stats = adaptive_lambda.item() if adaptive_lambda is not None else self.param_groups[0]["lambda_pop"]
 
         gate_sum = 0.0
         gate_numel = 0
         gate_low = 0
         gate_high = 0
+        lambda_sum = 0.0
+        lambda_numel = 0
         group_stats = []
         for group_idx, group in enumerate(self.param_groups):
             beta1, beta2 = group["betas"]
             rho = group["rho"]
             eps = group["eps"]
             alpha = group["alpha"]
-            lambda_pop = group["lambda_pop"]
             warmup_steps = group["warmup_steps"]
             gate_kind = group["gate"]
             local_sum = 0.0
@@ -372,7 +393,7 @@ class PopRiskAdamW(torch.optim.Optimizer):
                 v_hat = v / (1 - beta2**step)
                 s_hat = s / (1 - rho**step)
                 margin = m_hat.square() - alpha * s_hat
-                lambda_effective = adaptive_lambda if adaptive_lambda is not None else lambda_pop
+                lambda_effective = adaptive_lambda if adaptive_lambda is not None else self._scheduled_lambda(group, step)
 
                 if step <= warmup_steps:
                     q = torch.ones_like(m_hat, dtype=torch.float32)
@@ -394,10 +415,13 @@ class PopRiskAdamW(torch.optim.Optimizer):
                 q_sum = float(qf.sum().item())
                 low = int((qf < 0.01).sum().item())
                 high = int((qf > 0.99).sum().item())
+                lambda_value = float(lambda_effective.item() if isinstance(lambda_effective, Tensor) else lambda_effective)
                 gate_sum += q_sum
                 gate_numel += q_numel
                 gate_low += low
                 gate_high += high
+                lambda_sum += lambda_value * q_numel
+                lambda_numel += q_numel
                 local_sum += q_sum
                 local_numel += q_numel
                 local_low += low
@@ -413,7 +437,7 @@ class PopRiskAdamW(torch.optim.Optimizer):
             "q_mean": gate_sum / max(gate_numel, 1),
             "q_lt_0.01": gate_low / max(gate_numel, 1),
             "q_gt_0.99": gate_high / max(gate_numel, 1),
-            "lambda_pop": float(lambda_for_stats),
+            "lambda_pop": lambda_sum / max(lambda_numel, 1),
             "groups": group_stats,
         }
 
@@ -454,7 +478,9 @@ def parse_args():
     parser.add_argument("--cooldown-frac", type=float, default=0.7)
     parser.add_argument("--pop-alpha", type=float, default=1.0)
     parser.add_argument("--pop-lambda", type=float, default=1.0)
-    parser.add_argument("--pop-lambda-mode", choices=["fixed", "target-median-q"], default="fixed")
+    parser.add_argument("--pop-lambda-mode", choices=["fixed", "target-median-q", "cosine-decay"], default="fixed")
+    parser.add_argument("--pop-lambda-final", type=float, default=0.0)
+    parser.add_argument("--pop-lambda-decay-start-frac", type=float, default=0.5)
     parser.add_argument("--pop-target-q", type=float, default=0.5)
     parser.add_argument("--pop-rho", type=float, default=0.95)
     parser.add_argument("--pop-warmup-steps", type=int, default=20)
@@ -462,6 +488,9 @@ def parse_args():
     return parser.parse_args()
 
 args = parse_args()
+if not 0 <= args.pop_lambda_decay_start_frac <= 1:
+    raise ValueError("--pop-lambda-decay-start-frac must be between 0 and 1")
+pop_lambda_decay_start_step = int(args.train_steps * args.pop_lambda_decay_start_frac)
 data_dir = args.data_dir or default_data_dir()
 if args.download_chunks:
     download_fineweb10b(data_dir, args.download_chunks)
@@ -497,6 +526,7 @@ config = vars(args).copy()
 config["data_dir"] = str(data_dir)
 config["world_size"] = get_world_size()
 config["device_name"] = torch.cuda.get_device_name(device)
+config["pop_lambda_decay_start_step"] = pop_lambda_decay_start_step
 
 print0(code)
 print0("=" * 100)
@@ -537,6 +567,9 @@ if args.optimizer == "poprisk-adamw":
         alpha=args.pop_alpha,
         lambda_pop=args.pop_lambda,
         lambda_mode=args.pop_lambda_mode,
+        lambda_final=args.pop_lambda_final,
+        lambda_decay_start=pop_lambda_decay_start_step,
+        lambda_decay_end=args.train_steps,
         target_q=args.pop_target_q,
         warmup_steps=args.pop_warmup_steps,
         gate=args.pop_gate,
