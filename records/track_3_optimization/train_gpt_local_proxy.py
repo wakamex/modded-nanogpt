@@ -268,6 +268,174 @@ class Muon(torch.optim.Optimizer):
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
+@torch.no_grad()
+def scale_invariant_update_(param: Tensor, update: Tensor, lr: float, eps: float = 1e-10) -> None:
+    p_norm = param.norm()
+    u_norm = update.norm()
+    new_param = param - lr * update * p_norm / torch.clamp(u_norm, min=eps)
+    new_norm = torch.clamp(new_param.norm(), min=eps)
+    param.copy_(new_param / new_norm * p_norm)
+
+class AdamH(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=0.018,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        poprisk=False,
+        rho=0.95,
+        alpha=1.0,
+        lambda_pop=1.0,
+        lambda_mode="fixed",
+        lambda_final=0.0,
+        lambda_decay_start=0,
+        lambda_decay_end=1,
+        target_q=0.5,
+        warmup_steps=20,
+        gate="snr",
+    ):
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        if poprisk and lambda_mode != "fixed" and gate != "snr":
+            raise ValueError("adaptive lambda modes are currently defined only for --pop-gate snr")
+        if not 0 < target_q < 1:
+            raise ValueError("target_q must be strictly between 0 and 1")
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            poprisk=poprisk,
+            rho=rho,
+            alpha=alpha,
+            lambda_pop=lambda_pop,
+            lambda_mode=lambda_mode,
+            lambda_final=lambda_final,
+            lambda_decay_start=lambda_decay_start,
+            lambda_decay_end=lambda_decay_end,
+            target_q=target_q,
+            warmup_steps=warmup_steps,
+            gate=gate,
+        )
+        super().__init__(params, defaults)
+        self.last_gate_stats = {}
+
+    @staticmethod
+    def _scheduled_lambda(group, step):
+        if group["lambda_mode"] != "cosine-decay":
+            return group["lambda_pop"]
+        start = group["lambda_decay_start"]
+        end = group["lambda_decay_end"]
+        if step <= start:
+            return group["lambda_pop"]
+        if step >= end:
+            return group["lambda_final"]
+        progress = (step - start) / max(end - start, 1)
+        weight = 0.5 * (1 + math.cos(math.pi * progress))
+        return group["lambda_final"] + weight * (group["lambda_pop"] - group["lambda_final"])
+
+    @torch.no_grad()
+    def step(self):
+        snr_chunks = []
+        lambda_mode = self.param_groups[0]["lambda_mode"]
+        target_q = self.param_groups[0]["target_q"]
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            rho = group["rho"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad.detach().float()
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["m"] = torch.zeros_like(p, dtype=torch.float32)
+                    state["v"] = torch.zeros_like(p, dtype=torch.float32)
+                    if group["poprisk"]:
+                        state["s"] = torch.zeros_like(p, dtype=torch.float32)
+                m = state["m"]
+                v = state["v"]
+                s = state.get("s")
+                state["step"] += 1
+                step = state["step"]
+
+                if group["poprisk"]:
+                    diff = grad - m
+                    s.mul_(rho).addcmul_(diff, diff, value=1 - rho)
+                m.mul_(beta1).add_(grad, alpha=1 - beta1)
+                v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                if group["poprisk"] and lambda_mode == "target-median-q":
+                    m_hat = m / (1 - beta1**step)
+                    s_hat = s / (1 - rho**step)
+                    snr_chunks.append((m_hat.square() / (s_hat + eps)).flatten())
+
+        adaptive_lambda = None
+        if lambda_mode == "target-median-q" and snr_chunks:
+            r_median = torch.median(torch.cat(snr_chunks))
+            adaptive_lambda = r_median * (1 - target_q) / target_q
+
+        gate_sum = 0.0
+        gate_numel = 0
+        gate_low = 0
+        gate_high = 0
+        lambda_sum = 0.0
+        lambda_numel = 0
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            rho = group["rho"]
+            alpha = group["alpha"]
+            warmup_steps = group["warmup_steps"]
+            gate_kind = group["gate"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                step = state["step"]
+                m = state["m"]
+                v = state["v"]
+                m_hat = m / (1 - beta1**step)
+                v_hat = v / (1 - beta2**step)
+                update = m_hat / (v_hat.sqrt() + eps)
+
+                if group["poprisk"]:
+                    s = state["s"]
+                    s_hat = s / (1 - rho**step)
+                    margin = m_hat.square() - alpha * s_hat
+                    lambda_effective = adaptive_lambda if adaptive_lambda is not None else self._scheduled_lambda(group, step)
+                    if step <= warmup_steps:
+                        q = torch.ones_like(m_hat, dtype=torch.float32)
+                    elif gate_kind == "hard":
+                        q = (margin > 0).to(dtype=torch.float32)
+                    elif gate_kind == "snr":
+                        q = m_hat.square() / (m_hat.square() + lambda_effective * s_hat + eps)
+                    else:
+                        delta = margin.clamp_min(0)
+                        q = delta / (delta + lambda_effective * s_hat + eps)
+                    update = q * update
+
+                    qf = q.float()
+                    q_numel = qf.numel()
+                    lambda_value = float(lambda_effective.item() if isinstance(lambda_effective, Tensor) else lambda_effective)
+                    gate_sum += float(qf.sum().item())
+                    gate_numel += q_numel
+                    gate_low += int((qf < 0.01).sum().item())
+                    gate_high += int((qf > 0.99).sum().item())
+                    lambda_sum += lambda_value * q_numel
+                    lambda_numel += q_numel
+
+                scale_invariant_update_(p, update, group["lr"])
+
+        self.last_gate_stats = {}
+        if gate_numel:
+            self.last_gate_stats = {
+                "q_mean": gate_sum / gate_numel,
+                "q_lt_0.01": gate_low / gate_numel,
+                "q_gt_0.99": gate_high / gate_numel,
+                "lambda_pop": lambda_sum / max(lambda_numel, 1),
+            }
+
 class PopRiskAdamW(torch.optim.Optimizer):
     def __init__(
         self,
@@ -453,6 +621,7 @@ def default_data_dir():
 def parse_args():
     parser = argparse.ArgumentParser(description="Single-GPU/local proxy for Track 3 optimizer tests")
     parser.add_argument("--optimizer", choices=["adamw", "poprisk-adamw"], default="adamw")
+    parser.add_argument("--matrix-optimizer", choices=["muon", "adamh", "poprisk-adamh"], default="muon")
     parser.add_argument("--train-steps", type=int, default=1000)
     parser.add_argument("--val-interval", type=int, default=50)
     parser.add_argument("--dense-val-start", type=int, default=-1)
@@ -472,6 +641,10 @@ def parse_args():
     parser.add_argument("--muon-lr", type=float, default=0.025)
     parser.add_argument("--muon-wd", type=float, default=0.0125)
     parser.add_argument("--muon-ns-iters", type=int, default=12)
+    parser.add_argument("--adamh-lr", type=float, default=0.018)
+    parser.add_argument("--adamh-warmup-steps", type=int, default=-1)
+    parser.add_argument("--adamh-cooldown-frac", type=float, default=1.0)
+    parser.add_argument("--adamh-aux-cooldown-frac", type=float, default=0.4)
     parser.add_argument("--embed-lr", type=float, default=0.3)
     parser.add_argument("--proj-lr", type=float, default=1/320)
     parser.add_argument("--scalar-lr", type=float, default=0.01)
@@ -491,6 +664,7 @@ args = parse_args()
 if not 0 <= args.pop_lambda_decay_start_frac <= 1:
     raise ValueError("--pop-lambda-decay-start-frac must be between 0 and 1")
 pop_lambda_decay_start_step = int(args.train_steps * args.pop_lambda_decay_start_frac)
+adamh_warmup_steps = int(args.train_steps * 0.05) if args.adamh_warmup_steps < 0 else args.adamh_warmup_steps
 data_dir = args.data_dir or default_data_dir()
 if args.download_chunks:
     download_fineweb10b(data_dir, args.download_chunks)
@@ -511,7 +685,7 @@ torch.cuda.manual_seed(args.seed + get_rank())
 
 if is_master():
     os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/local_proxy_{args.optimizer}_{uuid.uuid4()}.txt"
+    logfile = f"logs/local_proxy_{args.optimizer}_{args.matrix_optimizer}_{uuid.uuid4()}.txt"
     print(logfile)
 
 def print0(s, console=False, log=True):
@@ -527,6 +701,7 @@ config["data_dir"] = str(data_dir)
 config["world_size"] = get_world_size()
 config["device_name"] = torch.cuda.get_device_name(device)
 config["pop_lambda_decay_start_step"] = pop_lambda_decay_start_step
+config["adamh_warmup_steps_resolved"] = adamh_warmup_steps
 
 print0(code)
 print0("=" * 100)
@@ -548,9 +723,22 @@ model = GPT(
 if args.compile:
     model.compile(dynamic=False)
 
-for name, p in model.named_parameters():
-    if "proj" in name:
-        p.data.zero_()
+if args.matrix_optimizer in ("adamh", "poprisk-adamh"):
+    for name, p in model.named_parameters():
+        if name.endswith(".attn.proj.weight"):
+            p.data.mul_(1.25)
+        elif name.endswith(".mlp.proj.weight"):
+            p.data.mul_(3.0)
+        elif name.endswith(".mlp.fc.weight"):
+            p.data.mul_(1.5)
+        elif name == "proj.weight":
+            p.data.zero_()
+        elif "proj" in name:
+            p.data.zero_()
+else:
+    for name, p in model.named_parameters():
+        if "proj" in name:
+            p.data.zero_()
 
 adam_groups = [
     dict(params=[model.embed.weight], lr=args.embed_lr),
@@ -576,17 +764,43 @@ if args.optimizer == "poprisk-adamw":
     )
 else:
     optimizer1 = torch.optim.AdamW(adam_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-optimizer2 = Muon(
-    [p for p in model.blocks.parameters() if p.ndim >= 2],
-    lr=args.muon_lr,
-    weight_decay=args.muon_wd,
-    ns_iters=args.muon_ns_iters,
-)
+matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
+if args.matrix_optimizer == "muon":
+    optimizer2 = Muon(
+        matrix_params,
+        lr=args.muon_lr,
+        weight_decay=args.muon_wd,
+        ns_iters=args.muon_ns_iters,
+    )
+else:
+    optimizer2 = AdamH(
+        matrix_params,
+        lr=args.adamh_lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        poprisk=args.matrix_optimizer == "poprisk-adamh",
+        rho=args.pop_rho,
+        alpha=args.pop_alpha,
+        lambda_pop=args.pop_lambda,
+        lambda_mode=args.pop_lambda_mode,
+        lambda_final=args.pop_lambda_final,
+        lambda_decay_start=pop_lambda_decay_start_step,
+        lambda_decay_end=args.train_steps,
+        target_q=args.pop_target_q,
+        warmup_steps=args.pop_warmup_steps,
+        gate=args.pop_gate,
+    )
 optimizers = [optimizer1, optimizer2]
 assert set(p for opt in optimizers for group in opt.param_groups for p in group["params"]) == set(model.parameters())
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+        group["schedule_type"] = "default"
+if args.matrix_optimizer in ("adamh", "poprisk-adamh"):
+    for group in optimizer1.param_groups:
+        group["schedule_type"] = "adamh_aux"
+    for group in optimizer2.param_groups:
+        group["schedule_type"] = "adamh_matrix"
 
 if dist_ready():
     for p in model.parameters():
@@ -595,13 +809,45 @@ if dist_ready():
 def set_hparams(step):
     progress = step / args.train_steps
     assert 0 <= progress < 1
-    if progress < 1 - args.cooldown_frac:
-        eta = 1.0
-    else:
-        eta = (1 - progress) / args.cooldown_frac
     for opt in optimizers:
         for group in opt.param_groups:
+            if group["schedule_type"] == "adamh_matrix":
+                if step < adamh_warmup_steps:
+                    eta = step / max(adamh_warmup_steps, 1)
+                elif progress < 1 - args.adamh_cooldown_frac:
+                    eta = 1.0
+                else:
+                    eta = (1 - progress) / args.adamh_cooldown_frac
+            elif group["schedule_type"] == "adamh_aux":
+                if progress < 1 - args.adamh_aux_cooldown_frac:
+                    eta = 1.0
+                else:
+                    eta = (1 - progress) / args.adamh_aux_cooldown_frac
+            elif progress < 1 - args.cooldown_frac:
+                eta = 1.0
+            else:
+                eta = (1 - progress) / args.cooldown_frac
             group["lr"] = group["initial_lr"] * eta
+
+def format_gate_stats():
+    items = [
+        ("aux", getattr(optimizer1, "last_gate_stats", {})),
+        ("matrix", getattr(optimizer2, "last_gate_stats", {})),
+    ]
+    items = [(name, stats) for name, stats in items if stats]
+    if not items:
+        return ""
+    parts = []
+    use_prefix = len(items) > 1
+    for name, stats in items:
+        prefix = f"{name}_" if use_prefix else ""
+        parts.append(
+            f" {prefix}q_mean:{stats.get('q_mean', 0):.4f}"
+            + f" {prefix}q_lt_0.01:{stats.get('q_lt_0.01', 0):.4f}"
+            + f" {prefix}q_gt_0.99:{stats.get('q_gt_0.99', 0):.4f}"
+            + f" {prefix}lambda_pop:{stats.get('lambda_pop', 0):.6g}"
+        )
+    return "".join(parts)
 
 def validate(step, training_time):
     if dist_ready():
@@ -661,15 +907,7 @@ for step in range(args.train_steps + 1):
     if step + 1 == 1 or (step + 1) % args.log_interval == 0:
         maybe_all_reduce(loss_sum)
         train_loss = loss_sum.item() / args.batch_tokens
-        gate_text = ""
-        if isinstance(optimizer1, PopRiskAdamW):
-            s = optimizer1.last_gate_stats
-            gate_text = (
-                f" q_mean:{s.get('q_mean', 0):.4f}"
-                + f" q_lt_0.01:{s.get('q_lt_0.01', 0):.4f}"
-                + f" q_gt_0.99:{s.get('q_gt_0.99', 0):.4f}"
-                + f" lambda_pop:{s.get('lambda_pop', 0):.6g}"
-            )
+        gate_text = format_gate_stats()
         print0(
             f"step:{step + 1}/{args.train_steps} train_loss:{train_loss:.8f} "
             + f"train_time:{approx_training_time:.3f}s "
