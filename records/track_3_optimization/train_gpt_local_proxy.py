@@ -277,9 +277,15 @@ class PopRiskAdamW(torch.optim.Optimizer):
         weight_decay=0.0,
         alpha=1.0,
         lambda_pop=1.0,
+        lambda_mode="fixed",
+        target_q=0.5,
         warmup_steps=20,
         gate="soft",
     ):
+        if lambda_mode != "fixed" and gate != "snr":
+            raise ValueError("adaptive lambda modes are currently defined only for --pop-gate snr")
+        if not 0 < target_q < 1:
+            raise ValueError("target_q must be strictly between 0 and 1")
         defaults = dict(
             betas=betas,
             rho=rho,
@@ -287,6 +293,8 @@ class PopRiskAdamW(torch.optim.Optimizer):
             weight_decay=weight_decay,
             alpha=alpha,
             lambda_pop=lambda_pop,
+            lambda_mode=lambda_mode,
+            target_q=target_q,
             warmup_steps=warmup_steps,
             gate=gate,
         )
@@ -295,23 +303,13 @@ class PopRiskAdamW(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
-        gate_sum = 0.0
-        gate_numel = 0
-        gate_low = 0
-        gate_high = 0
-        group_stats = []
-        for group_idx, group in enumerate(self.param_groups):
+        snr_chunks = []
+        lambda_mode = self.param_groups[0]["lambda_mode"]
+        target_q = self.param_groups[0]["target_q"]
+        for group in self.param_groups:
             beta1, beta2 = group["betas"]
             rho = group["rho"]
             eps = group["eps"]
-            alpha = group["alpha"]
-            lambda_pop = group["lambda_pop"]
-            warmup_steps = group["warmup_steps"]
-            gate_kind = group["gate"]
-            local_sum = 0.0
-            local_numel = 0
-            local_low = 0
-            local_high = 0
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -333,20 +331,58 @@ class PopRiskAdamW(torch.optim.Optimizer):
                 m.mul_(beta1).add_(grad, alpha=1 - beta1)
                 v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
+                if lambda_mode == "target-median-q":
+                    m_hat = m / (1 - beta1**step)
+                    s_hat = s / (1 - rho**step)
+                    snr_chunks.append((m_hat.square() / (s_hat + eps)).flatten())
+
+        adaptive_lambda = None
+        if lambda_mode == "target-median-q" and snr_chunks:
+            r_median = torch.median(torch.cat(snr_chunks))
+            adaptive_lambda = r_median * (1 - target_q) / target_q
+        lambda_for_stats = adaptive_lambda.item() if adaptive_lambda is not None else self.param_groups[0]["lambda_pop"]
+
+        gate_sum = 0.0
+        gate_numel = 0
+        gate_low = 0
+        gate_high = 0
+        group_stats = []
+        for group_idx, group in enumerate(self.param_groups):
+            beta1, beta2 = group["betas"]
+            rho = group["rho"]
+            eps = group["eps"]
+            alpha = group["alpha"]
+            lambda_pop = group["lambda_pop"]
+            warmup_steps = group["warmup_steps"]
+            gate_kind = group["gate"]
+            local_sum = 0.0
+            local_numel = 0
+            local_low = 0
+            local_high = 0
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                m = state["m"]
+                v = state["v"]
+                s = state["s"]
+                step = state["step"]
+
                 m_hat = m / (1 - beta1**step)
                 v_hat = v / (1 - beta2**step)
                 s_hat = s / (1 - rho**step)
                 margin = m_hat.square() - alpha * s_hat
+                lambda_effective = adaptive_lambda if adaptive_lambda is not None else lambda_pop
 
                 if step <= warmup_steps:
                     q = torch.ones_like(m_hat, dtype=torch.float32)
                 elif gate_kind == "hard":
                     q = (margin > 0).to(dtype=torch.float32)
                 elif gate_kind == "snr":
-                    q = m_hat.square() / (m_hat.square() + lambda_pop * s_hat + eps)
+                    q = m_hat.square() / (m_hat.square() + lambda_effective * s_hat + eps)
                 else:
                     delta = margin.clamp_min(0)
-                    q = delta / (delta + lambda_pop * s_hat + eps)
+                    q = delta / (delta + lambda_effective * s_hat + eps)
 
                 if group["weight_decay"] != 0:
                     p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -377,6 +413,7 @@ class PopRiskAdamW(torch.optim.Optimizer):
             "q_mean": gate_sum / max(gate_numel, 1),
             "q_lt_0.01": gate_low / max(gate_numel, 1),
             "q_gt_0.99": gate_high / max(gate_numel, 1),
+            "lambda_pop": float(lambda_for_stats),
             "groups": group_stats,
         }
 
@@ -417,6 +454,8 @@ def parse_args():
     parser.add_argument("--cooldown-frac", type=float, default=0.7)
     parser.add_argument("--pop-alpha", type=float, default=1.0)
     parser.add_argument("--pop-lambda", type=float, default=1.0)
+    parser.add_argument("--pop-lambda-mode", choices=["fixed", "target-median-q"], default="fixed")
+    parser.add_argument("--pop-target-q", type=float, default=0.5)
     parser.add_argument("--pop-rho", type=float, default=0.95)
     parser.add_argument("--pop-warmup-steps", type=int, default=20)
     parser.add_argument("--pop-gate", choices=["soft", "hard", "snr"], default="soft")
@@ -497,6 +536,8 @@ if args.optimizer == "poprisk-adamw":
         rho=args.pop_rho,
         alpha=args.pop_alpha,
         lambda_pop=args.pop_lambda,
+        lambda_mode=args.pop_lambda_mode,
+        target_q=args.pop_target_q,
         warmup_steps=args.pop_warmup_steps,
         gate=args.pop_gate,
     )
@@ -594,6 +635,7 @@ for step in range(args.train_steps + 1):
                 f" q_mean:{s.get('q_mean', 0):.4f}"
                 + f" q_lt_0.01:{s.get('q_lt_0.01', 0):.4f}"
                 + f" q_gt_0.99:{s.get('q_gt_0.99', 0):.4f}"
+                + f" lambda_pop:{s.get('lambda_pop', 0):.6g}"
             )
         print0(
             f"step:{step + 1}/{args.train_steps} train_loss:{train_loss:.8f} "
