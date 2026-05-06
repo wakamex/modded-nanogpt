@@ -198,6 +198,25 @@ CANDIDATES = {
         "--pop-lambda", "0.03",
         "--pop-warmup-steps", "200",
     ],
+    "poprisk-adamh-003-w0": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "poprisk-adamh",
+        "--pop-gate", "snr",
+        "--pop-lambda", "0.03",
+        "--pop-warmup-steps", "0",
+    ],
+    "poprisk-adamh-snr-wiener": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "poprisk-adamh",
+        "--pop-gate", "snr-wiener",
+        "--pop-warmup-steps", "0",
+    ],
+    "poprisk-adamh-snr-var": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "poprisk-adamh",
+        "--pop-gate", "snr-var",
+        "--pop-warmup-steps", "0",
+    ],
     "poprisk-adamh-adaptive-q050": [
         "--optimizer", "adamw",
         "--matrix-optimizer", "poprisk-adamh",
@@ -259,6 +278,18 @@ CANDIDATES = {
 }
 
 CAMPAIGNS = {
+    "adamh-poprisk-principled-4h": [
+        ("adamh", 3),
+        ("poprisk-adamh-003-w50", 3),
+        ("poprisk-adamh-003-w0", 3),
+        ("poprisk-adamh-snr-wiener", 3),
+        ("poprisk-adamh-snr-var", 3),
+        ("adamh", 4),
+        ("poprisk-adamh-003-w50", 4),
+        ("poprisk-adamh-003-w0", 4),
+        ("poprisk-adamh-snr-wiener", 4),
+        ("poprisk-adamh-snr-var", 4),
+    ],
     "adamh-poprisk-confirm-4h": [
         ("adamh", 1),
         ("poprisk-adamh-003-w50", 1),

@@ -228,6 +228,11 @@ def zeropower_via_newtonschulz5(G: Tensor, ns_iters: int) -> Tensor:
         X = X.mT
     return X
 
+def first_moment_variance_scale(beta1: float, step: int) -> float:
+    """Var(m_hat) / Var(g) for an EMA first moment under iid gradient noise."""
+    beta1_t = beta1**step
+    return (1 - beta1) ** 2 * (1 - beta1 ** (2 * step)) / ((1 - beta1**2) * (1 - beta1_t) ** 2)
+
 @torch.compile
 def muon_update(grad, momentum, mu: float, ns_iters: int, nesterov: bool = True):
     momentum.lerp_(grad, 1 - mu)
@@ -406,7 +411,13 @@ class AdamH(torch.optim.Optimizer):
                     s_hat = s / (1 - rho**step)
                     margin = m_hat.square() - alpha * s_hat
                     lambda_effective = adaptive_lambda if adaptive_lambda is not None else self._scheduled_lambda(group, step)
-                    if step <= warmup_steps:
+                    if gate_kind == "snr-wiener":
+                        lambda_effective = 1.0
+                        q = m_hat.square() / (m_hat.square() + s_hat + eps)
+                    elif gate_kind == "snr-var":
+                        lambda_effective = first_moment_variance_scale(beta1, step)
+                        q = m_hat.square() / (m_hat.square() + lambda_effective * s_hat + eps)
+                    elif step <= warmup_steps:
                         q = torch.ones_like(m_hat, dtype=torch.float32)
                     elif gate_kind == "hard":
                         q = (margin > 0).to(dtype=torch.float32)
@@ -565,7 +576,13 @@ class PopRiskAdamW(torch.optim.Optimizer):
                 margin = m_hat.square() - alpha * s_hat
                 lambda_effective = adaptive_lambda if adaptive_lambda is not None else self._scheduled_lambda(group, step)
 
-                if step <= warmup_steps:
+                if gate_kind == "snr-wiener":
+                    lambda_effective = 1.0
+                    q = m_hat.square() / (m_hat.square() + s_hat + eps)
+                elif gate_kind == "snr-var":
+                    lambda_effective = first_moment_variance_scale(beta1, step)
+                    q = m_hat.square() / (m_hat.square() + lambda_effective * s_hat + eps)
+                elif step <= warmup_steps:
                     q = torch.ones_like(m_hat, dtype=torch.float32)
                 elif gate_kind == "hard":
                     q = (margin > 0).to(dtype=torch.float32)
@@ -688,7 +705,7 @@ def parse_args():
     parser.add_argument("--pop-target-q", type=float, default=0.5)
     parser.add_argument("--pop-rho", type=float, default=0.95)
     parser.add_argument("--pop-warmup-steps", type=int, default=20)
-    parser.add_argument("--pop-gate", choices=["soft", "hard", "snr"], default="soft")
+    parser.add_argument("--pop-gate", choices=["soft", "hard", "snr", "snr-wiener", "snr-var"], default="soft")
     return apply_proxy_preset(parser.parse_args(), sys.argv[1:])
 
 args = parse_args()
