@@ -820,6 +820,19 @@ PROXY_PRESETS = {
         "log_interval": 10,
         "reference_batch_tokens": 8 * 64 * 1024,
     },
+    "realbatch-3090": {
+        "num_layers": 12,
+        "model_dim": 768,
+        "head_dim": 128,
+        "train_steps": 4875,
+        "stop_after_step": 100,
+        "batch_tokens": 8 * 64 * 1024,
+        "microbatch_seqs": 1,
+        "val_tokens": 1024 * 1024,
+        "val_interval": 50,
+        "log_interval": 10,
+        "reference_batch_tokens": 8 * 64 * 1024,
+    },
 }
 
 def _arg_was_provided(argv, dest: str) -> bool:
@@ -841,6 +854,8 @@ def parse_args():
                         choices=["muon", "adamh", "poprisk-adamh", "kfac-adamh", "kfac-muon", "kfac"],
                         default="muon")
     parser.add_argument("--train-steps", type=int, default=1000)
+    parser.add_argument("--stop-after-step", type=int, default=-1,
+                        help="Stop after this step while preserving --train-steps for schedules")
     parser.add_argument("--val-interval", type=int, default=50)
     parser.add_argument("--dense-val-start", type=int, default=-1)
     parser.add_argument("--log-interval", type=int, default=10)
@@ -889,8 +904,13 @@ def parse_args():
 args = parse_args()
 if not 0 <= args.pop_lambda_decay_start_frac <= 1:
     raise ValueError("--pop-lambda-decay-start-frac must be between 0 and 1")
+if args.stop_after_step < -1:
+    raise ValueError("--stop-after-step must be -1 or non-negative")
+if args.stop_after_step > args.train_steps:
+    raise ValueError("--stop-after-step must be <= --train-steps")
 pop_lambda_decay_start_step = int(args.train_steps * args.pop_lambda_decay_start_frac)
 adamh_warmup_steps = int(args.train_steps * 0.05) if args.adamh_warmup_steps < 0 else args.adamh_warmup_steps
+stop_after_step = args.train_steps if args.stop_after_step < 0 else args.stop_after_step
 data_dir = args.data_dir or default_data_dir()
 if args.download_chunks:
     download_fineweb10b(data_dir, args.download_chunks)
@@ -932,6 +952,7 @@ config["world_size"] = get_world_size()
 config["device_name"] = torch.cuda.get_device_name(device)
 config["pop_lambda_decay_start_step"] = pop_lambda_decay_start_step
 config["adamh_warmup_steps_resolved"] = adamh_warmup_steps
+config["stop_after_step_resolved"] = stop_after_step
 config["reference_batch_tokens_resolved"] = reference_batch_tokens
 config["grad_scale"] = grad_scale
 
@@ -1130,9 +1151,9 @@ training_time = 0.0
 if dist_ready():
     dist.barrier()
 t0 = time.perf_counter()
-for step in range(args.train_steps + 1):
+for step in range(stop_after_step + 1):
     should_validate = (
-        step == args.train_steps
+        step == stop_after_step
         or step % args.val_interval == 0
         or (args.dense_val_start >= 0 and step >= args.dense_val_start)
     )
@@ -1142,7 +1163,7 @@ for step in range(args.train_steps + 1):
         if dist_ready():
             dist.barrier()
         t0 = time.perf_counter()
-    if step == args.train_steps:
+    if step == stop_after_step:
         break
 
     inputs, targets = next(train_loader)

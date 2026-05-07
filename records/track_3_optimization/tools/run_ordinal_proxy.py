@@ -419,7 +419,10 @@ def parse_args():
                         help="Named run list; cannot be combined with positional candidates")
     parser.add_argument("--preset", default="ordinal-3090",
                         help="train_gpt_local_proxy.py proxy preset")
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=None,
+                        help="Override train steps; defaults to the train script or preset default")
+    parser.add_argument("--stop-after-step", type=int, default=None,
+                        help="Stop early while preserving --steps/--train-steps for schedules")
     parser.add_argument("--val-interval", type=int, default=50)
     parser.add_argument("--dense-val-start", type=int, default=-1)
     parser.add_argument("--log-interval", type=int, default=10)
@@ -473,12 +476,15 @@ def build_command(args, run: dict) -> list[str]:
         sys.executable,
         str(TRAIN_SCRIPT),
         "--proxy-preset", args.preset,
-        "--train-steps", str(args.steps),
         "--val-interval", str(args.val_interval),
         "--dense-val-start", str(args.dense_val_start),
         "--log-interval", str(args.log_interval),
         "--seed", str(run["seed"]),
     ]
+    if args.steps is not None:
+        cmd.extend(["--train-steps", str(args.steps)])
+    if args.stop_after_step is not None:
+        cmd.extend(["--stop-after-step", str(args.stop_after_step)])
     for flag, value in [
         ("--batch-tokens", args.batch_tokens),
         ("--reference-batch-tokens", args.reference_batch_tokens),
