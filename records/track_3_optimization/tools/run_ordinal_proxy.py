@@ -55,6 +55,15 @@ CANDIDATES = {
         "--muon-lr", "0.0375",
         "--muon-wd", "0.025",
     ],
+    "pmuon": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "pmuon",
+        "--muon-lr", "0.035",
+        "--muon-wd", "0.025",
+        "--pmuon-beta", "0.95",
+        "--pmuon-gamma", "0.3",
+        "--train-steps", "3250",
+    ],
     "adamh": [
         "--optimizer", "adamw",
         "--matrix-optimizer", "adamh",
@@ -313,6 +322,13 @@ CANDIDATES = {
 }
 
 CAMPAIGNS = {
+    "realbatch-calibration-100": [
+        ("adamh", 0),
+        ("muon-035-025", 0),
+        ("pmuon", 0),
+        ("kfac-muon", 0),
+        ("poprisk-adamh-snr-wiener", 0),
+    ],
     "kfac-proxy-3": [
         ("adamh", 6),
         ("muon-035-025", 6),

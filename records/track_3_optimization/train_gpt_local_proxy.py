@@ -279,6 +279,83 @@ class Muon(torch.optim.Optimizer):
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
+def symmetric_inverse_power(factor: Tensor, exponent: float, eps: float) -> Tensor:
+    factor = 0.5 * (factor + factor.T)
+    diag_mean = factor.diagonal().mean().abs().clamp_min(eps)
+    factor = factor / diag_mean
+    eigvals, eigvecs = torch.linalg.eigh(factor.float())
+    scales = eigvals.clamp_min(eps).pow(-exponent)
+    return (eigvecs * scales.unsqueeze(0)) @ eigvecs.T
+
+class PMuon(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=0.035,
+        weight_decay=0.025,
+        mu=0.95,
+        ns_iters=12,
+        beta=0.95,
+        gamma=0.3,
+        eps=1e-8,
+    ):
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            mu=mu,
+            ns_iters=ns_iters,
+            beta=beta,
+            gamma=gamma,
+            eps=eps,
+        )
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def _update_covariances(state, grad: Tensor, beta: float) -> None:
+        row_cov = grad @ grad.T
+        col_cov = grad.T @ grad
+        if "row_cov" not in state:
+            state["row_cov"] = row_cov
+            state["col_cov"] = col_cov
+        else:
+            state["row_cov"].mul_(beta).add_(row_cov, alpha=1 - beta)
+            state["col_cov"].mul_(beta).add_(col_cov, alpha=1 - beta)
+
+    @torch.no_grad()
+    def step(self):
+        world_size = get_world_size()
+        rank = get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params if world_size == 1 else params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            stride = 1 if world_size == 1 else world_size
+            for base_i in range(0, len(params), stride):
+                if world_size == 1:
+                    p = params[base_i]
+                elif base_i + rank < len(params):
+                    p = params[base_i + rank]
+                else:
+                    p = None
+                if p is not None:
+                    grad = p.grad.detach().float()
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p, dtype=torch.float32)
+                    self._update_covariances(state, grad, group["beta"])
+                    momentum = state["momentum"]
+                    momentum.lerp_(grad, 1 - group["mu"])
+                    update = grad.lerp(momentum, group["mu"])
+                    row_power = symmetric_inverse_power(state["row_cov"], group["gamma"], group["eps"])
+                    col_power = symmetric_inverse_power(state["col_cov"], group["gamma"], group["eps"])
+                    update = row_power @ update @ col_power
+                    update = orthogonalized_matrix_update(update, group["ns_iters"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                if world_size > 1:
+                    dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
 class KFACFactorStore:
     def __init__(self, modules, rho=0.95, damping=0.03, refresh_steps=1):
         self.rho = rho
@@ -851,7 +928,7 @@ def parse_args():
                         help="Apply a reusable local proxy shape before explicit CLI overrides")
     parser.add_argument("--optimizer", choices=["adamw", "poprisk-adamw"], default="adamw")
     parser.add_argument("--matrix-optimizer",
-                        choices=["muon", "adamh", "poprisk-adamh", "kfac-adamh", "kfac-muon", "kfac"],
+                        choices=["muon", "pmuon", "adamh", "poprisk-adamh", "kfac-adamh", "kfac-muon", "kfac"],
                         default="muon")
     parser.add_argument("--train-steps", type=int, default=1000)
     parser.add_argument("--stop-after-step", type=int, default=-1,
@@ -876,6 +953,9 @@ def parse_args():
     parser.add_argument("--muon-lr", type=float, default=0.025)
     parser.add_argument("--muon-wd", type=float, default=0.0125)
     parser.add_argument("--muon-ns-iters", type=int, default=12)
+    parser.add_argument("--pmuon-beta", type=float, default=0.95)
+    parser.add_argument("--pmuon-gamma", type=float, default=0.3)
+    parser.add_argument("--pmuon-eps", type=float, default=1e-8)
     parser.add_argument("--adamh-lr", type=float, default=0.018)
     parser.add_argument("--adamh-warmup-steps", type=int, default=-1)
     parser.add_argument("--adamh-cooldown-frac", type=float, default=1.0)
@@ -1032,6 +1112,16 @@ if args.matrix_optimizer == "muon":
         lr=args.muon_lr,
         weight_decay=args.muon_wd,
         ns_iters=args.muon_ns_iters,
+    )
+elif args.matrix_optimizer == "pmuon":
+    optimizer2 = PMuon(
+        matrix_params,
+        lr=args.muon_lr,
+        weight_decay=args.muon_wd,
+        ns_iters=args.muon_ns_iters,
+        beta=args.pmuon_beta,
+        gamma=args.pmuon_gamma,
+        eps=args.pmuon_eps,
     )
 elif args.matrix_optimizer in ("adamh", "poprisk-adamh", "kfac-adamh"):
     optimizer2 = AdamH(
