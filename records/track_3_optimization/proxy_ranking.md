@@ -8,6 +8,7 @@ Sources:
 
 - `logs/ordinal_proxy_summary_7ed92aba-9138-4481-b63b-03f43e76a32f.json`
 - `logs/ordinal_proxy_summary_63d9459b-01d2-4dc3-92e0-d06a54cbd50c.json`
+- `logs/ordinal_proxy_summary_6deeda97-3f35-4539-b2c8-e9a6821b70c4.json`
 - `.codex_logs/ordinal-calibration-poprisk-6h_20260506_133502.out`
 - `upstream/master:records/track_3_optimization/README.md`
 
@@ -24,52 +25,47 @@ Current upstream Track 3 ordering by accepted steps to 3.28:
 | 5 | AdamH | 4875 |
 | 6 | AdamW | 5625 |
 
-Our local proxy gets the broad class ordering right: Muon is far ahead of AdamH. But on seed `1340`, it ranks Muon `.025/.0125` ahead of `.035/.025`, which is backward relative to upstream. Treat the proxy as a useful filter, not a final judge.
+Our local proxy gets the broad class ordering right: Muon is far ahead of AdamH. But across seeds `1340` and `1341`, it ranks Muon `.025/.0125` ahead of `.035/.025`, which is backward relative to upstream. Treat the proxy as a useful filter, not a final judge.
 
-## Latest Calibration Seed
+## Latest Calibration Campaign
 
-Completed candidates from the current calibration campaign, seed `1340`, at proxy step `1000`:
+Completed candidates from `ordinal-calibration-poprisk-6h`, seeds `1340` and `1341`, at proxy step `1000`:
 
-| Rank | Candidate | Proxy val loss |
-|---:|---|---:|
-| 1 | Muon `.025/.0125` | `4.34916973` |
-| 2 | Muon `.035/.025` | `4.36258984` |
-| 3 | PopRisk-AdamH `snr-wiener` | `4.68850851` |
-| 4 | PopRisk-AdamH `.003-w0` | `4.70422554` |
-| 5 | PopRisk-AdamH `snr-var` | `4.70970201` |
-| 6 | PopRisk-AdamH `.003-w50` | `4.72950554` |
-| 7 | AdamH | `4.74654675` |
+| Rank | Candidate | Mean proxy val loss | Mean delta vs AdamH |
+|---:|---|---:|---:|
+| 1 | Muon `.025/.0125` | `4.35095048` | `-0.40175891` |
+| 2 | Muon `.035/.025` | `4.36343908` | `-0.38927031` |
+| 3 | PopRisk-AdamH `snr-wiener` | `4.69672513` | `-0.05598426` |
+| 4 | PopRisk-AdamH `.003-w0` | `4.71144605` | `-0.04126334` |
+| 5 | PopRisk-AdamH `snr-var` | `4.71458721` | `-0.03812218` |
+| 6 | PopRisk-AdamH `.003-w50` | `4.73618412` | `-0.01652527` |
+| 7 | AdamH | `4.75270939` | `0.00000000` |
 
-On this seed, every tested PopRisk-AdamH variant beats AdamH. The best one-seed result is `snr-wiener`.
+Across both seeds, every tested PopRisk-AdamH variant beats AdamH. The best replicated result in this calibration block is `snr-wiener`.
 
-## Previous Proxy Runs
+## All Paired Proxy Evidence
 
 The more reliable comparison is paired delta against same-seed AdamH, because raw proxy loss moves noticeably by seed.
 
 | Candidate | Seeds | Mean delta vs AdamH | Interpretation |
 |---|---:|---:|---|
-| `poprisk-adamh-003-w50` | 4 | `-0.01123` | strongest replicated result; beat AdamH 4/4 |
+| `poprisk-adamh-snr-wiener` | 2 | `-0.05598` | strongest replicated result so far; parameter-free SNR shrinker |
+| `poprisk-adamh-003-w0` | 2 | `-0.04126` | strong replicated no-warmup fixed-lambda SNR |
+| `poprisk-adamh-snr-var` | 2 | `-0.03812` | strong replicated variance-scaled SNR |
+| `poprisk-adamh-003-w50` | 5 | `-0.01219` | most replicated fixed-lambda result; beat AdamH 5/5 |
 | `poprisk-adamh-001-w50` | 3 | `-0.00538` | smaller but fairly consistent |
 | `poprisk-adamh-adaptive-q050` | 3 | `-0.00244` | marginal/noisy |
 | `poprisk-adamh-01` | 3 | `+0.00081` | not reliably helpful |
 
-New one-seed results from seed `1340`:
-
-| Candidate | Seed | Delta vs AdamH |
-|---|---:|---:|
-| `poprisk-adamh-snr-wiener` | 1340 | `-0.05804` |
-| `poprisk-adamh-003-w0` | 1340 | `-0.04232` |
-| `poprisk-adamh-snr-var` | 1340 | `-0.03684` |
-
 ## Current Triage
 
-1. Most reliable: `poprisk-adamh-003-w50`
-2. Most promising upside: `poprisk-adamh-snr-wiener`
-3. Also worth confirming: `poprisk-adamh-003-w0`, `poprisk-adamh-snr-var`
+1. Current top proxy candidate: `poprisk-adamh-snr-wiener`
+2. Also strong: `poprisk-adamh-003-w0`, `poprisk-adamh-snr-var`
+3. Most replicated but smaller effect: `poprisk-adamh-003-w50`
 4. Lower priority: `poprisk-adamh-001-w50`
 5. Probably drop for now: `poprisk-adamh-01`, adaptive median-q variants, cosine decay
 
-Practical read: previous proxy runs say `.003-w50` is real. The latest calibration seed says `snr-wiener` may be much better, but it only has one completed seed so far. Treat `snr-wiener` as the next thing to replicate, not yet as the champion.
+Practical read: `.003-w50` is real, but the two-seed calibration block now says `snr-wiener` is much stronger on this proxy. The major missing comparison remains against exact hard/soft PopRisk threshold gates.
 
 ## Reviewer-Priority Campaign
 
