@@ -59,6 +59,28 @@ CANDIDATES = {
         "--optimizer", "adamw",
         "--matrix-optimizer", "adamh",
     ],
+    "kfac-adamh": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "kfac-adamh",
+        "--kfac-damping", "0.03",
+        "--kfac-refresh-steps", "1",
+    ],
+    "kfac-muon": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "kfac-muon",
+        "--muon-lr", "0.035",
+        "--muon-wd", "0.025",
+        "--kfac-damping", "0.03",
+        "--kfac-refresh-steps", "1",
+    ],
+    "kfac": [
+        "--optimizer", "adamw",
+        "--matrix-optimizer", "kfac",
+        "--kfac-lr", "0.001",
+        "--kfac-wd", "0.025",
+        "--kfac-damping", "0.03",
+        "--kfac-refresh-steps", "1",
+    ],
     "poprisk-aux-0001": [
         "--optimizer", "poprisk-adamw",
         "--matrix-optimizer", "muon",
@@ -291,6 +313,13 @@ CANDIDATES = {
 }
 
 CAMPAIGNS = {
+    "kfac-proxy-3": [
+        ("adamh", 6),
+        ("muon-035-025", 6),
+        ("kfac-adamh", 6),
+        ("kfac-muon", 6),
+        ("kfac", 6),
+    ],
     "adamh-poprisk-review-8": [
         ("adamh", 5),
         ("poprisk-adamh-003", 5),

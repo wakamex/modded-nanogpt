@@ -279,6 +279,165 @@ class Muon(torch.optim.Optimizer):
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
+class KFACFactorStore:
+    def __init__(self, modules, rho=0.95, damping=0.03, refresh_steps=1):
+        self.rho = rho
+        self.damping = damping
+        self.refresh_steps = max(refresh_steps, 1)
+        self.states = {}
+        self.handles = []
+        for module in modules:
+            state = {"module": module, "step": 0}
+            self.states[module.weight] = state
+            self.handles.append(module.register_forward_hook(self._forward_hook(state)))
+            self.handles.append(module.register_full_backward_hook(self._backward_hook(state)))
+
+    @staticmethod
+    def _flatten_features(x: Tensor) -> Tensor:
+        return x.detach().float().reshape(-1, x.size(-1))
+
+    @staticmethod
+    def _accumulate_cov(state, prefix: str, x: Tensor) -> None:
+        flat = KFACFactorStore._flatten_features(x)
+        cov = (flat.T @ flat).mul_(1.0 / max(flat.size(0), 1))
+        sum_key = f"{prefix}_sum"
+        count_key = f"{prefix}_count"
+        if sum_key in state:
+            state[sum_key].add_(cov)
+            state[count_key] += 1
+        else:
+            state[sum_key] = cov
+            state[count_key] = 1
+
+    def _forward_hook(self, state):
+        def hook(module, inputs, output):
+            if not module.training or not torch.is_grad_enabled():
+                return
+            with torch.no_grad():
+                self._accumulate_cov(state, "a", inputs[0])
+        return hook
+
+    def _backward_hook(self, state):
+        def hook(module, grad_input, grad_output):
+            if not module.training or not grad_output or grad_output[0] is None:
+                return
+            with torch.no_grad():
+                self._accumulate_cov(state, "g", grad_output[0])
+        return hook
+
+    @staticmethod
+    def _sync_average(x: Tensor) -> Tensor:
+        if dist_ready():
+            dist.all_reduce(x, op=dist.ReduceOp.SUM)
+            x.mul_(1.0 / get_world_size())
+        return x
+
+    def _update_ema(self, state, prefix: str) -> bool:
+        sum_key = f"{prefix}_sum"
+        count_key = f"{prefix}_count"
+        if sum_key not in state:
+            return False
+        batch = state.pop(sum_key).mul_(1.0 / state.pop(count_key))
+        self._sync_average(batch)
+        ema_key = f"{prefix}_ema"
+        if ema_key not in state:
+            state[ema_key] = batch
+        else:
+            state[ema_key].mul_(self.rho).add_(batch, alpha=1 - self.rho)
+        return True
+
+    def _inverse_factor(self, factor: Tensor) -> Tensor:
+        factor = 0.5 * (factor + factor.T)
+        diag_mean = factor.diagonal().mean().abs().clamp_min(1e-8)
+        eye = torch.eye(factor.size(0), device=factor.device, dtype=factor.dtype)
+        damping = self.damping * diag_mean
+        for scale in (1.0, 10.0, 100.0, 1000.0):
+            damped = factor + (damping * scale + 1e-8) * eye
+            chol, info = torch.linalg.cholesky_ex(damped, check_errors=False)
+            if not bool(info.any().item()):
+                return torch.cholesky_inverse(chol)
+        return torch.linalg.pinv(factor + (damping * 1000.0 + 1e-8) * eye)
+
+    @torch.no_grad()
+    def update_factors(self) -> None:
+        for state in self.states.values():
+            updated_a = self._update_ema(state, "a")
+            updated_g = self._update_ema(state, "g")
+            if not (updated_a and updated_g):
+                continue
+            state["step"] += 1
+            if state["step"] == 1 or state["step"] % self.refresh_steps == 0:
+                state["a_inv"] = self._inverse_factor(state["a_ema"])
+                state["g_inv"] = self._inverse_factor(state["g_ema"])
+
+    @torch.no_grad()
+    def precondition(self, p: Tensor, update: Tensor) -> Tensor:
+        state = self.states.get(p)
+        if state is None or "a_inv" not in state or "g_inv" not in state:
+            return update.float()
+        return state["g_inv"] @ update.float() @ state["a_inv"]
+
+def kfac_linear_modules(model: nn.Module):
+    return [module for module in model.blocks.modules() if isinstance(module, Linear)]
+
+def orthogonalized_matrix_update(update: Tensor, ns_iters: int) -> Tensor:
+    out = zeropower_via_newtonschulz5(update, ns_iters)
+    out *= max(1, update.size(-2) / update.size(-1))**0.5
+    return out
+
+class KFACMuon(torch.optim.Optimizer):
+    def __init__(self, params, factor_store, lr=0.025, weight_decay=0.0125, mu=0.95, ns_iters=12):
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, ns_iters=ns_iters, factor_store=factor_store)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        factor_store = self.param_groups[0]["factor_store"]
+        factor_store.update_factors()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad.detach().float()
+                state = self.state[p]
+                if len(state) == 0:
+                    state["momentum"] = torch.zeros_like(p, dtype=torch.float32)
+                momentum = state["momentum"]
+                momentum.lerp_(grad, 1 - group["mu"])
+                update = grad.lerp(momentum, group["mu"])
+                update = factor_store.precondition(p, update)
+                update = orthogonalized_matrix_update(update, group["ns_iters"])
+                p.mul_(1 - group["lr"] * group["weight_decay"])
+                p.add_(update, alpha=-group["lr"])
+
+class KFAC(torch.optim.Optimizer):
+    def __init__(self, params, factor_store, lr=0.001, weight_decay=0.025, mu=0.95):
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, factor_store=factor_store)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        factor_store = self.param_groups[0]["factor_store"]
+        factor_store.update_factors()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad.detach().float()
+                state = self.state[p]
+                if len(state) == 0:
+                    state["momentum"] = torch.zeros_like(p, dtype=torch.float32)
+                momentum = state["momentum"]
+                momentum.lerp_(grad, 1 - group["mu"])
+                update = grad.lerp(momentum, group["mu"])
+                update = factor_store.precondition(p, update)
+                p.mul_(1 - group["lr"] * group["weight_decay"])
+                p.add_(update, alpha=-group["lr"])
+
 @torch.no_grad()
 def scale_invariant_update_(param: Tensor, update: Tensor, lr: float, eps: float = 1e-10) -> None:
     p_norm = param.norm()
@@ -305,6 +464,7 @@ class AdamH(torch.optim.Optimizer):
         target_q=0.5,
         warmup_steps=20,
         gate="snr",
+        kfac_store=None,
     ):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         if poprisk and lambda_mode != "fixed" and gate != "snr":
@@ -326,6 +486,7 @@ class AdamH(torch.optim.Optimizer):
             target_q=target_q,
             warmup_steps=warmup_steps,
             gate=gate,
+            kfac_store=kfac_store,
         )
         super().__init__(params, defaults)
         self.last_gate_stats = {}
@@ -346,6 +507,9 @@ class AdamH(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
+        kfac_store = self.param_groups[0].get("kfac_store")
+        if kfac_store is not None:
+            kfac_store.update_factors()
         snr_chunks = []
         lambda_mode = self.param_groups[0]["lambda_mode"]
         target_q = self.param_groups[0]["target_q"]
@@ -442,6 +606,8 @@ class AdamH(torch.optim.Optimizer):
                     lambda_sum += lambda_value * q_numel
                     lambda_numel += q_numel
 
+                if kfac_store is not None:
+                    update = kfac_store.precondition(p, update)
                 scale_invariant_update_(p, update, group["lr"])
 
         self.last_gate_stats = {}
@@ -671,7 +837,9 @@ def parse_args():
     parser.add_argument("--proxy-preset", choices=sorted(PROXY_PRESETS), default="small",
                         help="Apply a reusable local proxy shape before explicit CLI overrides")
     parser.add_argument("--optimizer", choices=["adamw", "poprisk-adamw"], default="adamw")
-    parser.add_argument("--matrix-optimizer", choices=["muon", "adamh", "poprisk-adamh"], default="muon")
+    parser.add_argument("--matrix-optimizer",
+                        choices=["muon", "adamh", "poprisk-adamh", "kfac-adamh", "kfac-muon", "kfac"],
+                        default="muon")
     parser.add_argument("--train-steps", type=int, default=1000)
     parser.add_argument("--val-interval", type=int, default=50)
     parser.add_argument("--dense-val-start", type=int, default=-1)
@@ -701,6 +869,12 @@ def parse_args():
     parser.add_argument("--proj-lr", type=float, default=1/320)
     parser.add_argument("--scalar-lr", type=float, default=0.01)
     parser.add_argument("--cooldown-frac", type=float, default=0.7)
+    parser.add_argument("--kfac-lr", type=float, default=0.001)
+    parser.add_argument("--kfac-wd", type=float, default=0.025)
+    parser.add_argument("--kfac-mu", type=float, default=0.95)
+    parser.add_argument("--kfac-factor-rho", type=float, default=0.95)
+    parser.add_argument("--kfac-damping", type=float, default=0.03)
+    parser.add_argument("--kfac-refresh-steps", type=int, default=1)
     parser.add_argument("--pop-alpha", type=float, default=1.0)
     parser.add_argument("--pop-lambda", type=float, default=1.0)
     parser.add_argument("--pop-lambda-mode", choices=["fixed", "target-median-q", "cosine-decay"], default="fixed")
@@ -781,7 +955,7 @@ model = GPT(
 if args.compile:
     model.compile(dynamic=False)
 
-if args.matrix_optimizer in ("adamh", "poprisk-adamh"):
+if args.matrix_optimizer in ("adamh", "poprisk-adamh", "kfac-adamh"):
     for name, p in model.named_parameters():
         if name.endswith(".attn.proj.weight"):
             p.data.mul_(1.25)
@@ -823,6 +997,14 @@ if args.optimizer == "poprisk-adamw":
 else:
     optimizer1 = torch.optim.AdamW(adam_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
 matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
+kfac_store = None
+if args.matrix_optimizer in ("kfac-adamh", "kfac-muon", "kfac"):
+    kfac_store = KFACFactorStore(
+        kfac_linear_modules(model),
+        rho=args.kfac_factor_rho,
+        damping=args.kfac_damping,
+        refresh_steps=args.kfac_refresh_steps,
+    )
 if args.matrix_optimizer == "muon":
     optimizer2 = Muon(
         matrix_params,
@@ -830,7 +1012,7 @@ if args.matrix_optimizer == "muon":
         weight_decay=args.muon_wd,
         ns_iters=args.muon_ns_iters,
     )
-else:
+elif args.matrix_optimizer in ("adamh", "poprisk-adamh", "kfac-adamh"):
     optimizer2 = AdamH(
         matrix_params,
         lr=args.adamh_lr,
@@ -847,6 +1029,24 @@ else:
         target_q=args.pop_target_q,
         warmup_steps=args.pop_warmup_steps,
         gate=args.pop_gate,
+        kfac_store=kfac_store,
+    )
+elif args.matrix_optimizer == "kfac-muon":
+    optimizer2 = KFACMuon(
+        matrix_params,
+        kfac_store,
+        lr=args.muon_lr,
+        weight_decay=args.muon_wd,
+        ns_iters=args.muon_ns_iters,
+        mu=args.kfac_mu,
+    )
+else:
+    optimizer2 = KFAC(
+        matrix_params,
+        kfac_store,
+        lr=args.kfac_lr,
+        weight_decay=args.kfac_wd,
+        mu=args.kfac_mu,
     )
 optimizers = [optimizer1, optimizer2]
 assert set(p for opt in optimizers for group in opt.param_groups for p in group["params"]) == set(model.parameters())
@@ -854,7 +1054,7 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
         group["schedule_type"] = "default"
-if args.matrix_optimizer in ("adamh", "poprisk-adamh"):
+if args.matrix_optimizer in ("adamh", "poprisk-adamh", "kfac-adamh"):
     for group in optimizer1.param_groups:
         group["schedule_type"] = "adamh_aux"
     for group in optimizer2.param_groups:
