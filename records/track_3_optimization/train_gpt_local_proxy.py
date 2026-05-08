@@ -1013,6 +1013,7 @@ grad_scale = reference_batch_tokens / args.batch_tokens
 torch.manual_seed(args.seed + get_rank())
 torch.cuda.manual_seed(args.seed + get_rank())
 
+logfile = ""
 if is_master():
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/local_proxy_{args.optimizer}_{args.matrix_optimizer}_{uuid.uuid4()}.txt"
